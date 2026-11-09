@@ -1,3 +1,5 @@
+![tests](https://github.com/<owner>/xlistener/actions/workflows/tests.yml/badge.svg)
+
 # XListener
 
 Mirror new posts from one X account to one Threads account in real time — text, single images, and multi-image carousels.
@@ -33,6 +35,16 @@ cp .env.example .env && chmod 600 .env
 ```
 
 Then fill `.env` and `config.json` and follow the phase gates in [AGENTS.md](AGENTS.md); it covers credentials, webhook registration, the `post.create` subscription, and the service.
+
+### Run it in observe mode first
+
+Set `"observe_only": true` under `webhook` in `config.json` for the first day. The listener then runs its full path — receives, verifies, filters, downloads media — but publishes nothing and touches no state:
+
+```
+[OBSERVE] would post tweet 1234567890123456789: text='gm' image=yes
+```
+
+Watch `mirror.log`, confirm the posts it *would* mirror are the ones you expect, then set it back to `false` and restart. That catches a wrong `x_user_id` or an unexpected filter decision before anything reaches your account.
 
 ## Architecture
 

@@ -189,6 +189,12 @@ loginctl enable-linger "$USER"     # keep it running after logout
 
 Verification, cheapest first:
 
+0. **Observe mode first.** Set `"observe_only": true` under `webhook` in
+   `config.json`, restart, and let it see a post or two. It logs
+   `[OBSERVE] would post tweet …` and publishes nothing (no Threads posts, no
+   `state.db` rows). This proves delivery, signature verification, author filtering
+   and media download before anything reaches the user's account. Then set it back
+   to `false` and restart.
 1. **Auth path, no side effects** — sign an empty payload with the consumer secret
    and POST it to the public URL. A `200 {"processed": []}` proves routing + HMAC.
    An unsigned POST must return `401`.
