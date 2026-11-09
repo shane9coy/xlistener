@@ -1,0 +1,25 @@
+[Unit]
+Description=XListener — mirror X posts to Threads via webhook
+Documentation=https://github.com/<owner>/xlistener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/xlistener
+ExecStart=%h/xlistener/venv/bin/python %h/xlistener/webhook_listener.py --host 127.0.0.1 --port 8644
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening. The listener only needs to write inside its own directory
+# (state.db, mirror.log, media_cache/). ProtectSystem=strict blocks everything else.
+# NOTE: do not add ProtectHome=read-only — the venv lives under the home directory
+# and site-packages reads fail under it.
+ProtectSystem=strict
+ReadWritePaths=%h/xlistener
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

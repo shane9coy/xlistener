@@ -1,0 +1,46 @@
+{
+  "_comment": "XListener configuration. Copy to config.json and fill in. Keys prefixed with _ are notes.",
+  "x_user_handle": "your_x_handle",
+  "x_user_id": "1111111111111111111",
+  "_x_user_id_note": "Numeric id of the X account to mirror. Leave empty to auto-resolve from x_user_handle on first run (costs one API call).",
+  "threads_handle": "your_threads_handle",
+  "_threads_handle_note": "Numeric Threads account id goes in .env as THREADS_USER_ID. This is the @handle used only for source URLs and logs.",
+
+  "env_dir": ".",
+  "_env_dir_note": "Directory containing .env. '.' = repo root.",
+
+  "state_db_path": "state.db",
+  "_state_db_note": "SQLite dedupe + audit table. Never commit it. One row per mirrored post.",
+  "media_cache_dir": "media_cache",
+  "_media_cache_note": "Downloaded X images live here before upload. Never commit it; it is X content.",
+  "log_file": "mirror.log",
+  "log_max_bytes": 5242880,
+  "log_backup_count": 3,
+
+  "threads_poster_script": "threads_poster.py",
+  "python_bin": "",
+  "_python_bin_note": "Interpreter used to run threads_poster.py. Empty = the interpreter running the listener.",
+
+  "max_tweets_per_tick": 10,
+  "_max_note": "Legacy polling cap; also the per-call X read cap enforced by x_budget.py.",
+
+  "x_budget": {
+    "_note": "Hard spend caps for anything that READS X posts. X bills per post RETURNED, not per call, so one paginated loop can drain a balance. Env overrides X_MAX_POSTS_PER_CALL / X_MAX_CALLS_PER_DAY / X_MAX_POSTS_PER_DAY can lower these but never raise them past the ceiling.",
+    "max_posts_per_call": 10,
+    "max_calls_per_day": 10,
+    "max_posts_per_day": 10
+  },
+
+  "webhook_crc_key": "auto",
+  "_webhook_crc_key_note": "Which secret keys the CRC response_token: auto | oauth2 | legacy. auto = OAuth 2.0 client secret when .env has X_OAUTH2_CLIENT_SECRET, else the OAuth 1.0 consumer secret.",
+
+  "webhook": {
+    "host": "127.0.0.1",
+    "port": 8644,
+    "_webhook_note": "The listener binds to loopback only; a tunnel exposes it to X. HMAC verification uses secrets from .env.",
+    "observe_only": false,
+    "_observe_note": "true = run everything but publish nothing to Threads (dry-run, state.db untouched). Set false for normal operation.",
+    "mirror_quote_posts": false,
+    "_quote_note": "false = skip quote posts (a repost with a comment)."
+  }
+}

@@ -1,0 +1,30 @@
+# ── secrets & local state (NEVER commit) ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+config.json
+state.db
+state.db-*
+*.sqlite
+*.sqlite3
+mirror.log
+replay.log
+*.log
+media_cache/
+oauth_nonce.txt
+oauth_code.txt
+.x-budget.json
+.venv/
+venv/
+
+# ── python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── editors / OS ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp

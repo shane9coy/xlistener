@@ -1,0 +1,22 @@
+# Cloudflare Tunnel example for XListener.
+#
+# X requires a public HTTPS webhook URL with NO port in it. A tunnel gives you one
+# without opening any inbound port.
+#
+#   cloudflared tunnel create xlistener
+#   cloudflared tunnel route dns xlistener listen.example.com
+#   cp deploy/cloudflared.example.yml ~/.cloudflared/config.yml   # then edit
+#   sudo systemctl enable --now cloudflared
+#
+# X's webhook requirement: https, publicly reachable, no port, answers the CRC GET.
+
+tunnel: <TUNNEL_ID>
+credentials-file: /home/<you>/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  # The webhook + Threads OAuth callback both live on this hostname.
+  - hostname: listen.example.com
+    service: http://127.0.0.1:8644
+
+  # Everything else 404s. Keep a catch-all last.
+  - service: http_status:404
