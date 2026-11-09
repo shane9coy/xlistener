@@ -213,6 +213,53 @@ check("crc can be pinned to oauth2", wl.select_crc_secret(OAUTH2, CONSUMER, "oau
 check("crc bogus override behaves as auto", wl.select_crc_secret(OAUTH2, CONSUMER, "bogus")[0] == OAUTH2)
 check("crc no secrets returns None", wl.select_crc_secret(None, None)[0] is None)
 
+
+# ==================== no back-links to the X post in mirrored text ====================
+# Regression: an AAA payload arrived WITHOUT display_text_range, so the t.co URL X
+# appends for attached media was published to Threads as a link back to the post.
+
+def _tweet(text, rng=None, media=True, refs=None):
+    d = {"id_str": "1", "text": text, "user": {"id_str": UID}}
+    if rng is not None:
+        d["display_text_range"] = rng
+    if refs:
+        d["referenced_tweets"] = refs
+    if media:
+        m = [{"type": "photo", "url": "https://t.co/MEDIA",
+              "media_url_https": "https://pbs.twimg.com/media/x.jpg"}]
+        d["entities"] = {"media": m}
+        d["extended_entities"] = {"media": m}
+    return d
+
+_LEAK = "When you get her on the custom self-hosted harness  https://t.co/JstzdB5DWR"
+_WORDS = "When you get her on the custom self-hosted harness"
+_AUTHOR_LINK = "check https://example.com/thing"
+
+check("media t.co stripped when display_text_range is missing",
+      wl.tweet_text(_tweet(_LEAK)) == _WORDS)
+check("media t.co stripped when display_text_range is present",
+      wl.tweet_text(_tweet(_LEAK, rng=[0, len(_WORDS)])) == _WORDS)
+check("quote post's appended status link stripped",
+      wl.tweet_text(_tweet("my take https://t.co/QUOTE", media=False,
+                           refs=[{"type": "quoted", "id": "9"}])) == "my take")
+check("author's own link in a text-only post is preserved",
+      wl.tweet_text(_tweet("new post https://example.com/thing", media=False))
+      == "new post https://example.com/thing")
+check("author's own link inside display_text_range is preserved",
+      wl.tweet_text(_tweet(_AUTHOR_LINK, rng=[0, len(_AUTHOR_LINK)])) == _AUTHOR_LINK)
+check("media post with no link is untouched",
+      wl.tweet_text(_tweet("just the words")) == "just the words")
+
+# XAA path: the envelope carries the t.co in text and may omit display_text_range
+_xaa_leak = wl.xaa_event_to_tweet_obj(xaa(
+    "post.create", {"id": POST_ID, "text": _LEAK, "author_id": UID,
+                    "attachments": {"media_keys": ["3_1"]}},
+    {"users": USERS["users"],
+     "media": [{"media_key": "3_1", "type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}]})["data"])
+check("XAA media t.co stripped when display_text_range is missing",
+      wl.tweet_text(_xaa_leak) == _WORDS)
+
+
 print()
 if failures:
     print(f"{len(failures)} FAILURE(S): {failures}")

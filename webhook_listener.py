@@ -208,20 +208,85 @@ def is_original_tweet(tweet_obj: dict) -> tuple[bool, str]:
     return True, ""
 
 
+TCO_URL_RE = re.compile(r"https?://t\.co/[A-Za-z0-9]+")
+# A URL that points at an X post itself. It has no meaning on Threads.
+X_STATUS_URL_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/[A-Za-z0-9_]+/status/[0-9]+\S*")
+
+
+def _media_holders(tweet_obj: dict):
+    """Yield every entities/extended_entities object a payload might carry media in."""
+    ext = tweet_obj.get("extended_tweet") or {}
+    for holder in (tweet_obj.get("entities"), tweet_obj.get("extended_entities"),
+                   ext.get("entities"), ext.get("extended_entities")):
+        if isinstance(holder, dict):
+            yield holder
+
+
+def _has_attached_media(tweet_obj: dict) -> bool:
+    for holder in _media_holders(tweet_obj):
+        if holder.get("media"):
+            return True
+    attachments = tweet_obj.get("attachments") or {}
+    return isinstance(attachments, dict) and bool(attachments.get("media_keys"))
+
+
+def _media_short_urls(tweet_obj: dict) -> set[str]:
+    """The t.co URLs X minted for attached media. They resolve back to the X post."""
+    urls: set[str] = set()
+    for holder in _media_holders(tweet_obj):
+        for item in holder.get("media") or []:
+            if isinstance(item, dict):
+                u = item.get("url")
+                if isinstance(u, str) and "t.co/" in u:
+                    urls.add(u)
+    return urls
+
+
 def tweet_text(tweet_obj: dict) -> str:
-    """The post as its author wrote it.
+    """The post as its author wrote it — never a link back to the X post.
 
     X's v1.1-shaped payload truncates `text` at 140 characters and keeps the whole
     post under `extended_tweet.full_text`. `display_text_range` marks where the
     human-written part ends; what follows is the t.co link X appends for attached
-    media, which means nothing on Threads.
+    media.
+
+    That range is not always present (X omits it for some payloads, and XAA
+    deliveries may not carry it), and when it is missing the appended media t.co
+    leaks into the published Threads post as a dead back-link. So after the range
+    cut we also strip the media's own short URLs, and — only when we could not
+    trust a range — any trailing t.co/X-status URL that is X's appended media link.
+    Links the author actually typed are inside the range and are left alone.
     """
     ext = tweet_obj.get("extended_tweet") or {}
     src = ext if ext.get("full_text") else tweet_obj
     text = src.get("full_text") or tweet_obj.get("text") or ""
+
+    ranged = False
     rng = src.get("display_text_range")
     if isinstance(rng, list) and len(rng) == 2 and all(isinstance(n, int) for n in rng) and 0 <= rng[0] < rng[1] <= len(text):
         text = text[rng[0]:rng[1]]
+        ranged = True
+
+    # Always drop the short URLs X minted for attached media.
+    for url in _media_short_urls(tweet_obj):
+        text = text.replace(url, "")
+
+    # No trustworthy range, but there is media: whatever t.co / status URL is left
+    # dangling at the end is X's appended link, not the author's words.
+    ref_types = {(r or {}).get("type") for r in (tweet_obj.get("referenced_tweets") or [])}
+    appended_link_possible = _has_attached_media(tweet_obj) or "quoted" in ref_types
+    if not ranged and appended_link_possible:
+        while True:
+            m = TCO_URL_RE.search(text.rstrip()) or X_STATUS_URL_RE.search(text.rstrip())
+            if not m:
+                break
+            after = text[:m.start()] + text[m.end():]
+            if after == text:
+                break
+            text = after
+
+    # Collapse the gap the removed link leaves behind.
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
 
