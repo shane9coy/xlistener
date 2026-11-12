@@ -6,7 +6,9 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+# Tests live in tests/ in the repo but at the service root on a deployed install.
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO))
 import x_budget as xb
 
 failures = []

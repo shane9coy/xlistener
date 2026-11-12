@@ -11,7 +11,9 @@ import logging
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent
+# Tests live in tests/ in the repo but at the service root on a deployed install.
+_HERE = Path(__file__).resolve().parent
+REPO = _HERE if (_HERE / "mirror.py").exists() else _HERE.parent
 sys.path.insert(0, str(REPO))
 
 import webhook_listener as wl
