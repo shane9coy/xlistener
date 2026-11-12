@@ -55,7 +55,9 @@ that timed out. The listener takes a **claim** in `state.db` before any slow wor
 second delivery is refused as `already-mirrored` instead of double-posting.
 
 **If you see this:** two attempts for one id — expected; the claim ledger suppresses the
-second. Drop the AAA subscription once XAA delivery is confirmed. A row with
+second. Once XAA delivery is confirmed, delete the AAA subscription (`DELETE
+/2/account_activity/webhooks/{webhook_id}/subscriptions/{user_id}/all`); expect
+`{"subscribed":false}` and an empty `subscriptions` list afterwards. A row with
 `status='error'` is deliberately NOT suppressed: the next delivery retries it, so a
 transient Threads failure does not lose the post.
 

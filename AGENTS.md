@@ -180,8 +180,19 @@ Expected: `POST /2/activity/subscriptions post.create -> HTTP 200`.
 
 > Account Activity (AAA) reaches end of life **2027-01-31**. XAA is its replacement.
 > If the user still has an old AAA subscription, X delivers each post **twice**
-> (once per format). That is harmless — `state.db` dedupes by post id — but remove
-> the AAA subscription once XAA delivery is confirmed.
+> (once per format) and keeps sending `favorite_events`. That is harmless — the claim
+> ledger suppresses the duplicate — but remove the AAA subscription once XAA delivery
+> is confirmed:
+>
+> ```bash
+> curl -s -X DELETE \
+>   -H "Authorization: Bearer $X_BEARER_TOKEN" \
+>   "https://api.x.com/2/account_activity/webhooks/<webhook_id>/subscriptions/<x_user_id>/all"
+> # expect {"data":{"subscribed":false}}; then verify:
+> curl -s -H "Authorization: Bearer $X_BEARER_TOKEN" \
+>   "https://api.x.com/2/account_activity/webhooks/<webhook_id>/subscriptions/all/list"
+> # expect "subscriptions": []
+> ```
 
 ## Phase 6 — run it as a service and verify end to end
 
