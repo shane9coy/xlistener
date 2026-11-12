@@ -94,12 +94,12 @@ def main() -> int:
     else:
         fail("python >= 3.10", platform.python_version(), "install Python 3.10+ and recreate the venv")
 
-    missing = [mod for mod in ("fastapi", "uvicorn", "requests", "tweepy")
+    missing = [mod for mod in ("fastapi", "uvicorn", "requests")
                if not __import__("importlib").util.find_spec(mod)]
     if missing:
         fail("python dependencies", f"missing: {', '.join(missing)}", "pip install -r requirements.txt")
     else:
-        ok("python dependencies", "fastapi, uvicorn, requests, tweepy")
+        ok("python dependencies", "fastapi, uvicorn, requests")
 
     # ---------- 2. config + env ----------
     cfg_path = Path(args.config)
@@ -140,11 +140,15 @@ def main() -> int:
             warn("OAuth 2.0 client secret", "absent — legacy OAuth1 secret only",
                  "add X_OAUTH2_CLIENT_SECRET if X reports webhook valid:true but no events arrive")
 
-    gitignore = (REPO / ".gitignore").read_text(errors="replace") if (REPO / ".gitignore").exists() else ""
-    if ".env" in gitignore and "state.db" in gitignore:
-        ok(".gitignore covers secrets", ".env, state.db")
+    # Only meaningful inside a checkout: a deployed install is not a git repo.
+    if not (REPO / ".git").exists():
+        skip(".gitignore covers secrets", "not a git checkout (deployed install)")
     else:
-        fail(".gitignore covers secrets", "missing .env or state.db", "restore the shipped .gitignore before committing")
+        gitignore = (REPO / ".gitignore").read_text(errors="replace") if (REPO / ".gitignore").exists() else ""
+        if ".env" in gitignore and "state.db" in gitignore:
+            ok(".gitignore covers secrets", ".env, state.db")
+        else:
+            fail(".gitignore covers secrets", "missing .env or state.db", "restore the shipped .gitignore before committing")
 
     # ---------- 3. local service ----------
     host = ((cfg.get("webhook") or {}).get("host") or "127.0.0.1").strip()
