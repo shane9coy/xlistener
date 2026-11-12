@@ -50,7 +50,12 @@ def sign(body: bytes, secret: str = CONSUMER) -> str:
 
 # --- app under test: temp paths + in-memory state -----------------------------
 tmp = Path(tempfile.mkdtemp(prefix="xlistener-it-"))
-cfg = wl.load_config(REPO / "config.example.json")
+# Prefer the shipped example (CI, fresh clone). On a deployed install there is no
+# example next to the tests, so fall back to the real config.json.
+_cfg_path = REPO / "config.example.json"
+if not _cfg_path.exists():
+    _cfg_path = REPO / "config.json"
+cfg = wl.load_config(_cfg_path)
 cfg["env_dir"] = str(tmp)
 cfg["media_cache_dir"] = str(tmp / "media_cache")
 cfg["threads_poster_script"] = str(REPO / cfg["threads_poster_script"])
