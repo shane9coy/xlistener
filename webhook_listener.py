@@ -38,15 +38,20 @@ from typing import Any
 import requests
 import uvicorn
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# Reuse the polling daemon's plumbing — config load, env load, state, threads-post subprocess.
+# Reuse the shared plumbing — config load, env load, state ledger, media download,
+# and the threads-post subprocess wrapper.
 import mirror as m
 
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
+
+# Hard cap on a webhook body. X's own payloads are a few KB; anything near a
+# megabyte is not a delivery and must not be buffered, authenticated or parsed.
+MAX_BODY_BYTES = 1024 * 1024
 
 
 # ---------- config + logger ----------
@@ -125,8 +130,18 @@ def verify_signature(
         if not header_value:
             continue
         expected = compute_signature(raw_body, secret)
-        if hmac.compare_digest(expected, header_value):
-            return True, header_name
+        # Compare BYTES: hmac.compare_digest raises TypeError for a str holding
+        # non-ASCII, which would turn a malformed header into a 500. A value that
+        # is not the ASCII signature simply fails to match and stays a 401.
+        try:
+            header_bytes = header_value.encode("latin-1", "replace")
+        except (AttributeError, UnicodeEncodeError):
+            continue
+        try:
+            if hmac.compare_digest(expected.encode("ascii"), header_bytes):
+                return True, header_name
+        except TypeError:
+            continue
     return False, ""
 
 
@@ -173,10 +188,22 @@ MEDIA_HOST_SUFFIXES = (".twimg.com",)
 
 
 def is_allowed_media_url(url: str) -> bool:
+    """Only https URLs on X's image CDN. Refuse anything parsers could disagree on."""
+    if not isinstance(url, str):
+        return False
+    # A backslash (or its percent-encoded form) is a path separator to some HTTP
+    # stacks and an ordinary character to urlparse. Reject on sight so the host
+    # we validate is the host requests would actually contact.
+    if "\\" in url or "%5c" in url.lower():
+        return False
     from urllib.parse import urlparse
     try:
         u = urlparse(url)
     except ValueError:
+        return False
+    # Userinfo ("https://user@host/") is never present on X's CDN and is a classic
+    # host-confusion trick: the visible host and the connected host differ.
+    if "@" in (u.netloc or ""):
         return False
     host = (u.hostname or "").lower()
     return u.scheme == "https" and any(host.endswith(sfx) for sfx in MEDIA_HOST_SUFFIXES)
@@ -254,8 +281,9 @@ def tweet_text(tweet_obj: dict) -> str:
     deliveries may not carry it), and when it is missing the appended media t.co
     leaks into the published Threads post as a dead back-link. So after the range
     cut we also strip the media's own short URLs, and — only when we could not
-    trust a range — any trailing t.co/X-status URL that is X's appended media link.
-    Links the author actually typed are inside the range and are left alone.
+    trust a range — a t.co/X-status URL anchored at the end of the text, which is
+    X's appended media link. Links the author actually typed are inside the range
+    (when there is one) and are otherwise left alone unless they are last.
     """
     ext = tweet_obj.get("extended_tweet") or {}
     src = ext if ext.get("full_text") else tweet_obj
@@ -271,19 +299,19 @@ def tweet_text(tweet_obj: dict) -> str:
     for url in _media_short_urls(tweet_obj):
         text = text.replace(url, "")
 
-    # No trustworthy range, but there is media: whatever t.co / status URL is left
-    # dangling at the end is X's appended link, not the author's words.
+    # No trustworthy range, but there is media: the only link we may remove is one
+    # X appended at the very END of the text. A t.co the author typed earlier is
+    # the author's link and stays put — searching for the first t.co anywhere was
+    # deleting typed links whenever X omitted display_text_range.
     ref_types = {(r or {}).get("type") for r in (tweet_obj.get("referenced_tweets") or [])}
     appended_link_possible = _has_attached_media(tweet_obj) or "quoted" in ref_types
     if not ranged and appended_link_possible:
-        while True:
-            m = TCO_URL_RE.search(text.rstrip()) or X_STATUS_URL_RE.search(text.rstrip())
-            if not m:
-                break
-            after = text[:m.start()] + text[m.end():]
-            if after == text:
-                break
-            text = after
+        trailing = re.search(
+            r"(?:" + TCO_URL_RE.pattern + "|" + X_STATUS_URL_RE.pattern + r")\s*\Z",
+            text,
+        )
+        if trailing:
+            text = text[:trailing.start()]
 
     # Collapse the gap the removed link leaves behind.
     text = re.sub(r"[ \t]{2,}", " ", text)
@@ -438,12 +466,20 @@ def xaa_event_to_tweet_obj(event: dict) -> dict | None:
         # is_original_tweet() refuses anything with a truthy retweeted_status.
         out["retweeted_status"] = {"id_str": ""}
     if full_text:
-        out["extended_tweet"] = {
+        extended: dict[str, Any] = {
             "full_text": full_text,
             "entities": {"media": [dict(item) for item in media_list]},
         }
-        if isinstance(post.get("display_text_range"), list):
-            out["extended_tweet"]["display_text_range"] = post["display_text_range"]
+        # Only the note's OWN display range describes the note text. The post-level
+        # range describes the truncated `text`; copying it here cut long posts back
+        # to ~140 characters. Without a trustworthy note range we omit the range so
+        # tweet_text() keeps the whole note and only drops X's trailing link.
+        note_range = note.get("display_text_range") if isinstance(note, dict) else None
+        if (isinstance(note_range, list) and len(note_range) == 2
+                and all(isinstance(n, int) for n in note_range)
+                and 0 <= note_range[0] < note_range[1] <= len(full_text)):
+            extended["display_text_range"] = note_range
+        out["extended_tweet"] = extended
     return out
 
 
@@ -476,32 +512,63 @@ def extract_candidate_tweets(payload: dict, logger: logging.Logger) -> list[dict
 
 # ---------- the mirror dispatcher ----------
 
-def mirror_one_tweet(
+def _tweet_id(tweet_obj: dict) -> str:
+    return str(tweet_obj.get("id_str") or tweet_obj.get("id") or "")
+
+
+def _source_url(cfg: dict, tweet_id: str) -> str:
+    handle = cfg.get("x_user_handle") or "?"
+    return f"https://x.com/{handle}/status/{tweet_id}"
+
+
+def publish_one_tweet(
     tweet_obj: dict,
     cfg: dict,
     conn: sqlite3.Connection,
     logger: logging.Logger,
-    threads_post_dir: Path,
     cache_dir: Path,
 ) -> dict:
-    """Mirror a single tweet to Threads. Used by both the webhook handler and any
-    on-demand CLI mode (--replay <tweet_id>)."""
-    tweet_id = str(tweet_obj.get("id_str") or tweet_obj.get("id"))
-    # tweet_id becomes part of a file path below; a real one is all digits.
+    """Publish one tweet that was already claimed (or observed). Never raises.
+
+    The webhook handler schedules this with FastAPI BackgroundTasks so the 200 goes
+    out before the slow work; mirror_one_tweet() calls it synchronously. On any
+    failure the row is recorded with status 'error' (retryable), never 'ok'.
+    """
+    tweet_id = _tweet_id(tweet_obj)
+    source_url = _source_url(cfg, tweet_id)
+    observe = bool((cfg.get("webhook") or {}).get("observe_only"))
     if not tweet_id.isdigit():
         logger.warning("[SKIP bad-id] tweet id is not numeric")
         return {"skipped": "bad-id"}
+    try:
+        return _publish_one_tweet(tweet_obj, cfg, conn, logger, cache_dir, tweet_id, source_url, observe)
+    except Exception as e:
+        logger.warning(f"[ERR post] tweet {tweet_id}: {e}")
+        if not observe:
+            try:
+                m.record_mirror(conn, tweet_id, None, None, source_url, f"post error: {e}")
+            except Exception as record_error:  # never let the background task explode
+                logger.error(f"[ERR state] tweet {tweet_id}: could not record failure: {record_error}")
+        return {"tweet_id": tweet_id, "error": f"post: {e}"}
+
+
+def _publish_one_tweet(
+    tweet_obj: dict,
+    cfg: dict,
+    conn: sqlite3.Connection,
+    logger: logging.Logger,
+    cache_dir: Path,
+    tweet_id: str,
+    source_url: str,
+    observe: bool,
+) -> dict:
     text = tweet_text(tweet_obj)
-    handle = cfg.get("x_user_handle") or "?"
-    source_url = f"https://x.com/{handle}/status/{tweet_id}"
-
-    if m.is_already_mirrored(conn, tweet_id):
-        logger.info(f"[SKIP already-mirrored] tweet {tweet_id}")
-        return {"tweet_id": tweet_id, "skipped": "already-mirrored"}
-
     photos = extract_tweet_photos(tweet_obj)
     if not photos and not text:
         logger.info(f"[SKIP empty] tweet {tweet_id}")
+        if not observe:
+            # Nothing will ever be published; do not leave the claim pending forever.
+            m.release_claim(conn, tweet_id)
         return {"tweet_id": tweet_id, "skipped": "empty"}
 
     # Download photos (skip if no photos — text-only is fine).
@@ -523,38 +590,59 @@ def mirror_one_tweet(
             local_photos.append(dest)
     except Exception as e:
         logger.warning(f"[ERR download] tweet {tweet_id}: {e}")
-        m.record_mirror(conn, tweet_id, None, None, source_url, f"download error: {e}")
+        if not observe:
+            m.record_mirror(conn, tweet_id, None, None, source_url, f"download error: {e}")
         return {"tweet_id": tweet_id, "error": f"download: {e}"}
 
-    # Posts to the single eligible Media: text + image in one container.
-    # Threads supports multi-image carousels via the threads-post skill but
-    # that's not yet wired; for now we send just the first photo.
     image_path = local_photos[0] if local_photos else None
+    if observe:
+        # Observed posts are logged, published only as a dry run (which uploads
+        # nothing), and never written to state.db — so a later real run can still
+        # mirror the same post.
+        logger.info(f"[OBSERVE] would post tweet {tweet_id}: text={text[:80]!r} image={'yes' if image_path else 'no'}")
+    logger.info(f"mirroring tweet {tweet_id} with {len(local_photos)} photo(s)")
+    # 1 photo -> single image post; 2+ -> Threads carousel (X's multi-image post).
+    result = m.run_threads_post(
+        cfg, text,
+        local_photos[0] if len(local_photos) == 1 else None,
+        dry_run=observe, logger=logger,
+        image_paths=local_photos,
+    )
+    if observe:
+        return {"tweet_id": tweet_id, "observed": True}
+    post_id = (result.get("published") or {}).get("id") or result.get("container_id")
+    post_url = result.get("post_url")
+    m.record_mirror(conn, tweet_id, post_id, post_url, source_url, None)
+    logger.info(f"[OK] mirrored tweet {tweet_id} → threads {post_url or post_id}")
+    # Maintenance: each mirror downloads fresh images, so prune the cache on the
+    # success path only. Failures are retried and must not delete their media.
     try:
-        # run_threads_post accepts the same args whether called from CLI tick
-        # or here; we always pass dry_run=False since this is a real event.
-        observe = bool((cfg.get("webhook") or {}).get("observe_only"))
-        # 1 photo -> single image post; 2+ -> Threads carousel (X's multi-image post).
-        logger.info(f"mirroring tweet {tweet_id} with {len(local_photos)} photo(s)")
-        result = m.run_threads_post(
-            cfg, text,
-            local_photos[0] if len(local_photos) == 1 else None,
-            dry_run=observe, logger=logger,
-            image_paths=local_photos,
-        )
-        if observe:
-            # Not recorded in state.db, so the same post can still be mirrored for real later.
-            logger.info(f"[OBSERVE] would post tweet {tweet_id}: text={text[:80]!r} image={'yes' if image_path else 'no'}")
-            return {"tweet_id": tweet_id, "observed": True}
-        post_id = (result.get("published") or {}).get("id") or result.get("container_id")
-        post_url = result.get("post_url")
-        m.record_mirror(conn, tweet_id, post_id, post_url, source_url, None)
-        logger.info(f"[OK] mirrored tweet {tweet_id} → threads {post_url or post_id}")
-        return {"tweet_id": tweet_id, "threads_post_id": post_id, "threads_post_url": post_url}
+        m.prune_media_cache(cache_dir, cfg.get("media_cache_max_age_hours", 48), logger)
     except Exception as e:
-        logger.warning(f"[ERR post] tweet {tweet_id}: {e}")
-        m.record_mirror(conn, tweet_id, None, None, source_url, f"post error: {e}")
-        return {"tweet_id": tweet_id, "error": f"post: {e}"}
+        logger.warning(f"[WARN prune] media cache: {e}")
+    return {"tweet_id": tweet_id, "threads_post_id": post_id, "threads_post_url": post_url}
+
+
+def mirror_one_tweet(
+    tweet_obj: dict,
+    cfg: dict,
+    conn: sqlite3.Connection,
+    logger: logging.Logger,
+    cache_dir: Path,
+) -> dict:
+    """Claim then publish synchronously. Kept for tests and one-off use."""
+    tweet_id = _tweet_id(tweet_obj)
+    # tweet_id becomes part of a file path below; a real one is all digits.
+    if not tweet_id.isdigit():
+        logger.warning("[SKIP bad-id] tweet id is not numeric")
+        return {"skipped": "bad-id"}
+    observe = bool((cfg.get("webhook") or {}).get("observe_only"))
+    source_url = _source_url(cfg, tweet_id)
+    # Observe mode writes nothing to state.db, so it takes no claim.
+    if not observe and not m.claim_mirror(conn, tweet_id, source_url):
+        logger.info(f"[SKIP already-mirrored] tweet {tweet_id}")
+        return {"tweet_id": tweet_id, "skipped": "already-mirrored"}
+    return publish_one_tweet(tweet_obj, cfg, conn, logger, cache_dir)
 
 
 # ---------- FastAPI app ----------
@@ -566,8 +654,7 @@ def build_app(
     conn: sqlite3.Connection,
     logger: logging.Logger,
 ) -> FastAPI:
-    threads_post_dir = Path(cfg.get("env_dir") or HERE)
-    cache_dir = HERE / cfg["media_cache_dir"]
+    cache_dir = m.resolve_dir(cfg.get("media_cache_dir"), HERE)
     cache_dir.mkdir(parents=True, exist_ok=True)
     x_user_id = int(cfg.get("x_user_id") or 0)
     handle = cfg.get("x_user_handle") or "?"
@@ -665,13 +752,42 @@ def build_app(
         return {"response_token": response_token}
 
     @app.post("/webhooks/twitter")
-    async def events(request: Request):
-        raw_body = await request.body()
+    async def events(request: Request, background: BackgroundTasks):
         sender = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else "?")
         agent = (request.headers.get("user-agent") or "?")[:60]
         # Header NAMES only — never values. This is what tells us which credential
         # scheme X is actually using on a delivery or a rejection.
         sig_headers = [h for h in (SIG_HEADER_OAUTH2, SIG_HEADER_LEGACY) if request.headers.get(h)]
+        observe = bool((cfg.get("webhook") or {}).get("observe_only"))
+
+        # Size cap BEFORE auth and BEFORE buffering: a declared oversize body is
+        # refused without reading it, and a chunked body is cut off mid-stream so
+        # an unauthenticated caller cannot make us allocate unbounded memory.
+        declared = request.headers.get("content-length")
+        if declared is not None:
+            try:
+                declared_len = int(declared)
+            except ValueError:
+                declared_len = 0
+            if declared_len > MAX_BODY_BYTES:
+                logger.warning(
+                    f"POST rejected: content-length {declared_len} > {MAX_BODY_BYTES} cap "
+                    f"(from {sender}, ua={agent})"
+                )
+                return JSONResponse({"error": "payload too large"}, status_code=413)
+
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                logger.warning(
+                    f"POST rejected: streamed body exceeded {MAX_BODY_BYTES} bytes "
+                    f"(from {sender}, ua={agent})"
+                )
+                return JSONResponse({"error": "payload too large"}, status_code=413)
+            chunks.append(chunk)
+        raw_body = b"".join(chunks)
 
         # HMAC verify against whichever signature scheme X used (timing-safe).
         ok, matched_header = verify_signature(raw_body, request.headers, oauth2_secret, consumer_secret)
@@ -765,17 +881,35 @@ def build_app(
                 for it in (tweet_obj.get("entities", {}) or {}).get("media", [])
             )
             if has_video and photo_count == 0:
-                tweet_id = str(tweet_obj.get("id_str") or tweet_obj.get("id"))
+                tweet_id = _tweet_id(tweet_obj)
                 logger.info(f"[SKIP video-only] tweet {tweet_id}")
                 results.append({"tweet_id": tweet_id, "skipped": "video-only"})
                 continue
 
-            r = mirror_one_tweet(
-                tweet_obj, cfg, conn, logger,
-                threads_post_dir=threads_post_dir,
-                cache_dir=cache_dir,
-            )
-            results.append(r)
+            tweet_id = _tweet_id(tweet_obj)
+            if not tweet_id.isdigit():
+                logger.warning("[SKIP bad-id] tweet id is not numeric")
+                results.append({"skipped": "bad-id"})
+                continue
+            if not photo_count and not tweet_text(tweet_obj):
+                logger.info(f"[SKIP empty] tweet {tweet_id}")
+                results.append({"tweet_id": tweet_id, "skipped": "empty"})
+                continue
+
+            # Claim BEFORE any slow work, synchronously, so a duplicate delivery
+            # (or X retrying the same event) cannot double-post. A failed claim is
+            # never published. Observe mode takes no claim and writes nothing.
+            if not observe:
+                if not m.claim_mirror(conn, tweet_id, _source_url(cfg, tweet_id)):
+                    logger.info(f"[SKIP already-mirrored] tweet {tweet_id}")
+                    results.append({"tweet_id": tweet_id, "skipped": "already-mirrored"})
+                    continue
+
+            # The publish (media download + threads-post subprocess) can take tens
+            # of seconds — far past X's delivery timeout — so it runs after the
+            # response. The claim above already reserves the post.
+            background.add_task(publish_one_tweet, tweet_obj, cfg, conn, logger, cache_dir)
+            results.append({"tweet_id": tweet_id, "queued": True})
 
         return {"processed": results}
 
@@ -785,25 +919,48 @@ def build_app(
 # ---------- main ----------
 
 def main() -> int:
+    # --config decides which file supplies the bind defaults, so peek at it first.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=str(CONFIG_PATH))
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_config(Path(pre_args.config))
+    webhook_cfg = cfg.get("webhook") or {}
+
     p = argparse.ArgumentParser(
-        description="Stream-only X→Threads mirror via Account Activity webhook."
+        description="Stream-only X\u2192Threads mirror via Account Activity webhook."
     )
-    p.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1 — tunneled via cloudflared)")
-    p.add_argument("--port", type=int, default=8644, help="Bind port (default 8644)")
+    p.add_argument("--host", default=webhook_cfg.get("host") or "127.0.0.1",
+                   help="Bind host (default from config: webhook.host)")
+    p.add_argument("--port", type=int, default=int(webhook_cfg.get("port") or 8644),
+                   help="Bind port (default from config: webhook.port)")
     p.add_argument("--config", default=str(CONFIG_PATH))
     p.add_argument("--log-file", help="Override log file path")
     args = p.parse_args()
-
-    cfg = load_config(Path(args.config))
 
     log_path = Path(args.log_file) if args.log_file else HERE / cfg["log_file"]
     logger = make_logger(log_path, int(cfg["log_max_bytes"]), int(cfg["log_backup_count"]))
     logger.info(f"x-threads-mirror-webhook starting on {args.host}:{args.port}")
 
+    # x_user_id is REQUIRED. Resolving it from the X API costs a billed read, so the
+    # listener refuses to guess and tells the operator what to fix instead.
+    x_user_id = str(cfg.get("x_user_id") or "").strip()
+    if not x_user_id.isdigit():
+        message = (
+            "config.json is missing a numeric x_user_id. Set x_user_id to the numeric "
+            f"id of the X account to mirror (@{cfg.get('x_user_handle') or '?'}) "
+            "and restart. The listener does not auto-resolve it: that costs a billed X "
+            "read, and an empty value makes every delivery fail the author check."
+        )
+        logger.error(message)
+        print(message, file=sys.stderr)
+        return 2
+
     # HMAC keys for webhook verification and CRC.
     #   consumer_secret = X OAuth 1.0a consumer secret (legacy signature header)
     #   oauth2_secret   = X OAuth 2.0 client secret   (preferred by the current docs)
-    env_dir = Path(cfg.get("env_dir") or HERE)
+    # Paths in config are resolved against the repo, never the process CWD — the
+    # listener is started by systemd, where CWD is not the repo.
+    env_dir = m.resolve_dir(cfg.get("env_dir"), HERE)
     x_creds = m.load_x_creds(env_dir)  # (consumer_key, consumer_secret, access_token, access_token_secret)
     consumer_secret = x_creds[1]
     oauth2_secret = load_oauth2_client_secret(env_dir)
@@ -822,20 +979,11 @@ def main() -> int:
     if not (oauth2_secret or consumer_secret):
         logger.error("No webhook signing secret at all; every CRC and POST will fail")
 
-    # Verify Threads creds loaded (used inside mirror_one_tweet via subprocess).
+    # Verify Threads creds loaded (used by the poster subprocess).
     m.load_threads_creds(env_dir)
 
-    # SQLite state (shared DB with the legacy mirror.py for idempotency).
-    conn = m.init_state(HERE / cfg["state_db_path"])
-
-    # If x_user_id isn't pinned in config, resolve it from the API.
-    if not cfg.get("x_user_id"):
-        import tweepy
-        x_client = m.make_x_client(x_creds[:4])
-        uid = m.resolve_user_id(x_client, cfg.get("x_user_handle") or "")
-        cfg["x_user_id"] = uid
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
-        logger.info(f"resolved @{cfg.get('x_user_handle')} → user_id={uid}")
+    # SQLite state (dedupe/claim ledger shared with the other tools).
+    conn = m.init_state(m.resolve_dir(cfg["state_db_path"], HERE))
 
     app = build_app(cfg, consumer_secret, oauth2_secret, conn, logger)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

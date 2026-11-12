@@ -32,6 +32,10 @@ Usage:
   # Dry-run (prints container payloads, doesn't POST)
   post_to_threads.py --dry-run "Preview only."
 
+This module is a CLI. The webhook listener runs it as a subprocess
+(`mirror.run_threads_post`) rather than importing it, so a publish failure can never
+take the listener down. Imports from tests are for unit coverage only.
+
 Reference: https://developers.facebook.com/documentation/threads/posts.md
 """
 from __future__ import annotations
@@ -50,25 +54,46 @@ from pathlib import Path
 # Env resolution:
 #   1. $THREADS_POST_ENV override (set to a .env path)
 #   2. <repo>/.env  (next to this script)
-override = os.environ.get("THREADS_POST_ENV", "").strip()
+# Loaded lazily and kept in a private dict: the values are NOT exported into
+# os.environ, so a wrapped or compromised child (curl) cannot inherit the X and
+# Threads credentials.
 HOME = Path.home()
 REPO_DIR = Path(__file__).resolve().parent
-candidates = [Path(override)] if override else []
-candidates += [REPO_DIR / ".env"]
-for candidate in candidates:
-    if str(candidate) and Path(candidate).exists():
-        ENV_FILE = Path(candidate)
-        break
-else:
-    ENV_FILE = REPO_DIR / ".env"  # default; will fail with a clear error if missing
+_ENV_CACHE: dict[str, str] | None = None
 
-if ENV_FILE.exists():
-    for line in ENV_FILE.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+
+def _env_file() -> Path:
+    override = os.environ.get("THREADS_POST_ENV", "").strip()
+    if override and Path(override).exists():
+        return Path(override)
+    return REPO_DIR / ".env"
+
+
+def _load_env() -> dict[str, str]:
+    global _ENV_CACHE
+    if _ENV_CACHE is None:
+        _ENV_CACHE = {}
+        path = _env_file()
+        if path.exists():
+            for line in path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                _ENV_CACHE[k.strip()] = v.strip().strip('"').strip("'")
+    return _ENV_CACHE
+
+
+class ThreadsPostError(SystemExit):
+    """A user-actionable failure.
+
+    Subclasses SystemExit so the CLI still exits with the message, while library and
+    test callers can catch it instead of the process dying.
+    """
+
+
+def _fail(message: str) -> None:
+    raise ThreadsPostError(message)
 
 
 THREADS_API = "https://graph.threads.net/v1.0"
@@ -117,12 +142,13 @@ IMAGE_HOSTS = [
 
 
 def _require_creds() -> tuple[str, str]:
-    token = os.environ.get("THREADS_ACCESS_TOKEN", "").strip()
-    uid = os.environ.get("THREADS_USER_ID", "").strip()
+    env = _load_env()
+    token = env.get("THREADS_ACCESS_TOKEN", "").strip()
+    uid = env.get("THREADS_USER_ID", "").strip()
     if not token:
-        sys.exit("THREADS_ACCESS_TOKEN not set in .env — see tools/threads_oauth.py")
+        _fail("THREADS_ACCESS_TOKEN not set in .env — see tools/threads_oauth.py")
     if not uid:
-        sys.exit("THREADS_USER_ID not set in .env — see tools/threads_oauth.py")
+        _fail("THREADS_USER_ID not set in .env — see tools/threads_oauth.py")
     return token, uid
 
 
@@ -140,7 +166,7 @@ def _form_post(url: str, data: dict, timeout: float = 30.0) -> dict:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body_text = e.read().decode(errors="replace")
-        sys.exit(f"POST {url} → {e.code}: {body_text}")
+        _fail(f"POST {url} → {e.code}: {body_text}")
 
 
 def _guess_mime(path: str) -> str:
@@ -148,11 +174,43 @@ def _guess_mime(path: str) -> str:
     return mt or "application/octet-stream"
 
 
+# Only these hosts may be handed to Meta as the image_url. Anything else could be
+# used to make Meta fetch arbitrary content (or us HEAD an internal address).
+UPLOAD_HOST_ALLOWLIST = ("uguu.se", "litterbox.catbox.moe", "catbox.moe", "0x0.st")
+
+
+def _is_allowed_upload_url(url: str) -> bool:
+    try:
+        u = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if u.scheme != "https":
+        return False
+    if "@" in (u.netloc or "") or "\\" in url:
+        return False
+    host = (u.hostname or "").lower()
+    return any(host == allowed or host.endswith("." + allowed) for allowed in UPLOAD_HOST_ALLOWLIST)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: D102
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _verify_public_url(url: str) -> bool:
-    """HEAD the URL and check it actually returns bytes (not 0-length, not HTML)."""
+    """HEAD the URL and check it actually returns bytes (not 0-length, not HTML).
+
+    Redirects are refused: the allow-list must not be escapeable through a 3xx.
+    """
+    if not _is_allowed_upload_url(url):
+        print(f"  ! URL host is not an allow-listed upload host — skipping: {url}", file=sys.stderr)
+        return False
     try:
         req = urllib.request.Request(url, method="HEAD")
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _NO_REDIRECT_OPENER.open(req, timeout=15) as resp:
             ct = resp.headers.get("Content-Type", "").lower()
             cl = resp.headers.get("Content-Length", "")
             if not ct.startswith("image/"):
@@ -174,23 +232,23 @@ def upload_to_public_host(path: str) -> str:
     Verifies the result with a HEAD request (catches 0-length responses, wrong MIME, etc).
     """
     if not Path(path).exists():
-        sys.exit(f"Image not found: {path}")
+        _fail(f"Image not found: {path}")
     mime = _guess_mime(path)
     if mime not in IMAGE_TYPES:
-        sys.exit(f"Unsupported image type: {mime}. Use jpg/png/webp.")
+        _fail(f"Unsupported image type: {mime}. Use jpg/png/webp.")
 
     print(f"Uploading {path} to a public host (Meta API will cURL this URL)…", file=sys.stderr)
     for label, args, extractor in IMAGE_HOSTS:
         print(f"  → trying {label}…", end="", flush=True, file=sys.stderr)
         cmd = [a.replace("{path}", path) for a in args]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
             if result.returncode != 0:
                 print(f" curl failed (exit {result.returncode})", file=sys.stderr)
                 continue
             url = extractor(result.stdout)
-            if not url or not url.startswith("http"):
-                print(f" no URL in response: {result.stdout!r}", file=sys.stderr)
+            if not url or not _is_allowed_upload_url(url):
+                print(f" no allow-listed URL in response: {result.stdout!r}", file=sys.stderr)
                 continue
             # Sanity-check the URL
             if not _verify_public_url(url):
@@ -203,12 +261,12 @@ def upload_to_public_host(path: str) -> str:
         except Exception as e:
             print(f" error: {e}", file=sys.stderr)
 
-    sys.exit("All public image hosts failed. Try --image-url with a URL you uploaded manually.")
+    _fail("All public image hosts failed. Try --image-url with a URL you uploaded manually.")
 
 
 def _create_text_container(token: str, user_id: str, text: str, reply_to: str | None) -> str:
     if len(text) > TEXT_LIMIT:
-        sys.exit(f"Text too long: {len(text)} chars (Threads limit is {TEXT_LIMIT})")
+        _fail(f"Text too long: {len(text)} chars (Threads limit is {TEXT_LIMIT})")
     payload = {
         "media_type": "TEXT",
         "text": text,
@@ -219,7 +277,7 @@ def _create_text_container(token: str, user_id: str, text: str, reply_to: str | 
     resp = _form_post(f"{THREADS_API}/{user_id}/threads", payload)
     cid = resp.get("id")
     if not cid:
-        sys.exit(f"No container id in response: {resp}")
+        _fail(f"No container id in response: {resp}")
     return cid
 
 
@@ -245,7 +303,7 @@ def _create_image_container(
     resp = _form_post(f"{THREADS_API}/{user_id}/threads", payload)
     cid = resp.get("id")
     if not cid:
-        sys.exit(f"No container id in response: {resp}")
+        _fail(f"No container id in response: {resp}")
     return cid
 
 
@@ -260,9 +318,9 @@ def _create_carousel_parent(
     on the parent only.
     """
     if len(child_ids) < CAROUSEL_MIN_ITEMS:
-        sys.exit(f"Carousel needs at least {CAROUSEL_MIN_ITEMS} items, got {len(child_ids)}")
+        _fail(f"Carousel needs at least {CAROUSEL_MIN_ITEMS} items, got {len(child_ids)}")
     if len(child_ids) > CAROUSEL_MAX_ITEMS:
-        sys.exit(f"Carousel allows at most {CAROUSEL_MAX_ITEMS} items, got {len(child_ids)}")
+        _fail(f"Carousel allows at most {CAROUSEL_MAX_ITEMS} items, got {len(child_ids)}")
     payload = {
         "media_type": "CAROUSEL",
         "children": ",".join(child_ids),
@@ -270,14 +328,14 @@ def _create_carousel_parent(
     }
     if text:
         if len(text) > TEXT_LIMIT:
-            sys.exit(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
+            _fail(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
         payload["text"] = text
     if reply_to:
         payload["reply_to_id"] = reply_to
     resp = _form_post(f"{THREADS_API}/{user_id}/threads", payload)
     cid = resp.get("id")
     if not cid:
-        sys.exit(f"No carousel container id in response: {resp}")
+        _fail(f"No carousel container id in response: {resp}")
     return cid
 
 
@@ -291,13 +349,13 @@ def _publish(token: str, user_id: str, creation_id: str) -> dict:
     url = f"{THREADS_API}/{user_id}/threads_publish"
     body = urllib.parse.urlencode({"creation_id": creation_id, "access_token": token}).encode()
     delay = 2.0
-    for attempt in range(1, 10):
+    for attempt in range(1, 4):
         req = urllib.request.Request(
             url, data=body, method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=30.0) as resp:
+            with urllib.request.urlopen(req, timeout=15.0) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             body_text = e.read().decode(errors="replace")
@@ -305,13 +363,13 @@ def _publish(token: str, user_id: str, creation_id: str) -> dict:
             if not_ready and attempt < 9:
                 print(f"  container {creation_id} not ready (attempt {attempt}), retrying in {delay:.0f}s", file=sys.stderr)
                 time.sleep(delay)
-                delay = min(delay * 1.5, 12.0)
+                delay = min(delay * 1.5, 6.0)
                 continue
-            sys.exit(f"POST {url} → {e.code}: {body_text}")
-    sys.exit(f"POST {url}: container {creation_id} never became publishable")
+            _fail(f"POST {url} → {e.code}: {body_text}")
+    _fail(f"POST {url}: container {creation_id} never became publishable")
 
 
-def _verify_published(token: str, post_id: str, timeout: int = 30) -> dict | None:
+def _verify_published(token: str, post_id: str, timeout: int = 8) -> dict | None:
     """The Threads publish endpoint can return a 200 with a numeric ID even when
     the post is silently invalid (we've seen this: permalink 302s to
     `?error=invalid_post`, GET returns "does not exist"). The signal that a post
@@ -340,7 +398,7 @@ def _verify_published(token: str, post_id: str, timeout: int = 30) -> dict | Non
 
 def _publish_with_verify(
     token: str, user_id: str, creation_id: str,
-    recreate_fn=None, max_retries: int = 2,
+    recreate_fn=None, max_retries: int = 1,
 ) -> dict:
     """Publish a container and verify the result is actually live. Retry on silent
     failure (publish returns success but post is invalid). `recreate_fn` is a
@@ -352,10 +410,10 @@ def _publish_with_verify(
         pub = _publish(token, user_id, creation_id)
         post_id = pub.get("id")
         if not post_id:
-            sys.exit(f"Publish attempt {attempt}: no id in response: {pub}")
+            _fail(f"Publish attempt {attempt}: no id in response: {pub}")
         last_post_id = post_id
         print(f"  publish attempt {attempt}: id={post_id}", file=sys.stderr)
-        verified = _verify_published(token, post_id, timeout=30)
+        verified = _verify_published(token, post_id, timeout=8)
         if verified:
             print(f"  → verified live: {verified.get('permalink')}", file=sys.stderr)
             return verified
@@ -369,10 +427,10 @@ def _publish_with_verify(
             _wait_for_image_ready(token, user_id, creation_id)
         else:
             print(f"  → still not live after {attempt} attempts.", file=sys.stderr)
-    sys.exit(f"Publish failed verification after {max_retries + 1} attempts. Last id: {last_post_id}")
+    _fail(f"Publish failed verification after {max_retries + 1} attempts. Last id: {last_post_id}")
 
 
-def _wait_for_image_ready(token: str, user_id: str, creation_id: str, max_wait: int = 60) -> None:
+def _wait_for_image_ready(token: str, user_id: str, creation_id: str, max_wait: int = 20) -> None:
     """Poll the container status until FINISHED or error. The doc says wait 30s on average
     for image processing; we cap at max_wait seconds."""
     deadline = time.time() + max_wait
@@ -385,7 +443,7 @@ def _wait_for_image_ready(token: str, user_id: str, creation_id: str, max_wait: 
             if status == "FINISHED":
                 return
             if status in ("ERROR", "EXPIRED"):
-                sys.exit(f"Container {creation_id} failed: status={status}, error={data.get('error_message')}")
+                _fail(f"Container {creation_id} failed: status={status}, error={data.get('error_message')}")
         except Exception:
             pass
         time.sleep(3)
@@ -396,7 +454,7 @@ def post_text(text: str, reply_to: str | None = None, dry_run: bool = False) -> 
     payload = {
         "media_type": "TEXT",
         "text": text,
-        "access_token": token,
+        "access_token": "<token>" if dry_run else token,
     }
     if reply_to:
         payload["reply_to_id"] = reply_to
@@ -427,12 +485,31 @@ def post_image(
 ) -> dict:
     token, uid = _require_creds()
     if image_path and image_url:
-        sys.exit("Pass either --image or --image-url, not both.")
+        _fail("Pass either --image or --image-url, not both.")
     if not image_path and not image_url:
-        sys.exit("Image post requires --image <path> or --image-url <url>.")
+        _fail("Image post requires --image <path> or --image-url <url>.")
+    if text and len(text) > TEXT_LIMIT:
+        _fail(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
+    if image_path and not Path(image_path).exists():
+        _fail(f"Image not found: {image_path}")
+
+    # A dry run must not upload anything: observe mode is the documented "publish
+    # nothing" gate, and uploading still leaks the media to a third-party host.
+    if dry_run:
+        return {
+            "dry_run": True,
+            "step1_create": f"{THREADS_API}/{uid}/threads",
+            "step1_payload": {
+                "media_type": "IMAGE",
+                "image_url": image_url or "<local file, uploaded on a real run>",
+                "is_carousel_item": "false",
+                "text": text,
+                "access_token": "<token>",
+            },
+            "step2_publish": f"{THREADS_API}/{uid}/threads_publish",
+        }
+
     if image_path:
-        if not Path(image_path).exists():
-            sys.exit(f"Image not found: {image_path}")
         image_url = upload_to_public_host(image_path)
 
     payload = {
@@ -442,18 +519,9 @@ def post_image(
         "access_token": token,
     }
     if text:
-        if len(text) > TEXT_LIMIT:
-            sys.exit(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
         payload["text"] = text
     if reply_to:
         payload["reply_to_id"] = reply_to
-    if dry_run:
-        return {
-            "dry_run": True,
-            "step1_create": f"{THREADS_API}/{uid}/threads",
-            "step1_payload": payload,
-            "step2_publish": f"{THREADS_API}/{uid}/threads_publish",
-        }
     cid = _create_image_container(token, uid, text, image_url, reply_to)
     _wait_for_image_ready(token, uid, cid)
     pub = _publish_with_verify(
@@ -484,14 +552,14 @@ def post_carousel(
     paths = list(image_paths or [])
     urls = list(image_urls or [])
     if paths and urls:
-        sys.exit("Pass either --images or --image-urls, not both.")
+        _fail("Pass either --images or --image-urls, not both.")
     total = len(paths) + len(urls)
     if total < CAROUSEL_MIN_ITEMS:
-        sys.exit(f"Carousel needs at least {CAROUSEL_MIN_ITEMS} images, got {total}")
+        _fail(f"Carousel needs at least {CAROUSEL_MIN_ITEMS} images, got {total}")
     if total > CAROUSEL_MAX_ITEMS:
-        sys.exit(f"Carousel allows at most {CAROUSEL_MAX_ITEMS} images, got {total}")
+        _fail(f"Carousel allows at most {CAROUSEL_MAX_ITEMS} images, got {total}")
     if text and len(text) > TEXT_LIMIT:
-        sys.exit(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
+        _fail(f"Caption too long: {len(text)} chars (limit {TEXT_LIMIT})")
 
     child_payload = {
         "media_type": "IMAGE",
@@ -532,7 +600,7 @@ def post_carousel(
     if paths:
         for path in paths:
             if not Path(path).exists():
-                sys.exit(f"Image not found: {path}")
+                _fail(f"Image not found: {path}")
         urls = [upload_to_public_host(p) for p in paths]
 
     def _create_children() -> list[str]:
@@ -610,22 +678,22 @@ def _load_text_thread_arg(raw: str) -> list[str]:
     if raw.startswith("@"):
         path = Path(raw[1:]).expanduser()
         if not path.is_file():
-            sys.exit(f"--text-thread file not found: {path}")
+            _fail(f"--text-thread file not found: {path}")
         try:
             data = json.loads(path.read_text())
         except json.JSONDecodeError as e:
-            sys.exit(f"--text-thread file is not valid JSON: {e}")
+            _fail(f"--text-thread file is not valid JSON: {e}")
         if not isinstance(data, list) or not all(isinstance(s, str) for s in data):
-            sys.exit("--text-thread JSON file must be an array of strings")
+            _fail("--text-thread JSON file must be an array of strings")
         return data
     stripped = raw.strip()
     if stripped.startswith("["):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as e:
-            sys.exit(f"--text-thread literal is not valid JSON: {e}")
+            _fail(f"--text-thread literal is not valid JSON: {e}")
         if not isinstance(data, list) or not all(isinstance(s, str) for s in data):
-            sys.exit("--text-thread literal JSON must be an array of strings")
+            _fail("--text-thread literal JSON must be an array of strings")
         return data
     return [p for p in raw.split("|||") if p.strip()]
 
@@ -645,14 +713,14 @@ def post_text_thread(texts: list[str], dry_run: bool = False) -> dict:
     """
     MAX_CHAIN = 10
     if not texts:
-        sys.exit("--text-thread requires at least 1 post")
+        _fail("--text-thread requires at least 1 post")
     if len(texts) > MAX_CHAIN:
-        sys.exit(f"--text-thread cap is {MAX_CHAIN} posts; got {len(texts)}")
+        _fail(f"--text-thread cap is {MAX_CHAIN} posts; got {len(texts)}")
     for i, t in enumerate(texts, 1):
         if not t.strip():
-            sys.exit(f"--text-thread post {i} is empty")
+            _fail(f"--text-thread post {i} is empty")
         if len(t) > TEXT_LIMIT:
-            sys.exit(f"--text-thread post {i} is {len(t)} chars (limit {TEXT_LIMIT})")
+            _fail(f"--text-thread post {i} is {len(t)} chars (limit {TEXT_LIMIT})")
 
     token, uid = _require_creds()
 
@@ -774,4 +842,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ThreadsPostError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.exit(1)

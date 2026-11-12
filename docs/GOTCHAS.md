@@ -50,10 +50,14 @@ against a captured `crc_token` rather than loosening it; a JSON object must neve
 
 ## 6. AAA and XAA deliver the same post twice
 
-During overlap both payload formats can arrive on one webhook. Dedupe by post id.
+During overlap both payload formats can arrive on one webhook, and X retries a delivery
+that timed out. The listener takes a **claim** in `state.db` before any slow work, so the
+second delivery is refused as `already-mirrored` instead of double-posting.
 
-**If you see this:** two mirror attempts for one id — expected during migration; `state.db`
-suppresses the second. Drop the AAA subscription once XAA delivery is confirmed.
+**If you see this:** two attempts for one id — expected; the claim ledger suppresses the
+second. Drop the AAA subscription once XAA delivery is confirmed. A row with
+`status='error'` is deliberately NOT suppressed: the next delivery retries it, so a
+transient Threads failure does not lose the post.
 
 ## 7. X delivered an empty `tweet_create_events: []` array
 
@@ -97,15 +101,45 @@ A dead token looks exactly like a delivery outage: `[ERR post]` on every event.
 **If you see this:** every event logging `[ERR post]` — call `GET /{id}?fields=id,username` with
 the token; if it fails, re-authorize inside the 60-day window.
 
-## 12. Never write synthetic rows into the dedupe table
+## 12. Never write synthetic rows into the claim ledger
 
-The polling bookmark is `MAX(tweet_id)`. One oversized fake id wedges future mirroring: the
-`since_id` filter then matches nothing, forever.
+The table is keyed by post id and every row means something: `pending` blocks a post for 15
+minutes, `ok` suppresses it forever, `error` allows a retry. A fake `ok` row for a real id
+means that post never mirrors.
 
-**If you see this:** X has new posts but nothing ever mirrors — inspect
-`SELECT MAX(CAST(tweet_id AS INTEGER)) FROM mirrored`; remove the bogus row.
+**If you see this:** one specific post never appears — check
+`SELECT * FROM mirrored WHERE tweet_id = '<id>'`. Remove a bogus row, or clear genuine
+failures with `tools/replay_backlog.py --reset-errors`.
 
-## 13. Handler-level regressions are invisible without integration tests
+## 13. A webhook `200` no longer means "published"
+
+The listener claims the post, answers X immediately, and publishes on a background task —
+because publishing takes longer than X's 10-second delivery timeout. So a `200 {"queued":
+true}` means accepted, not on Threads yet. The publish outcome is the `[OK]` / `[ERR …]` line
+that follows.
+
+**If you see this:** a `200` with no `[OK]` — read the next log lines. A failure records
+`status='error'` and the next delivery of that post retries it.
+
+## 14. Observe mode is only safe because it uploads nothing
+
+`observe_only` used to build the real payloads, which uploaded every image to a public host
+before the dry-run check — so "publishes nothing" still leaked media. Dry runs now return the
+plan before any upload, take no claim, and write no rows.
+
+**If you see this:** an image host upload while `observe_only` is true — the dry-run return
+must stay above `upload_to_public_host()` in `threads_poster.py`.
+
+## 15. Every mirrored image leaves your machine for an anonymous public host
+
+Meta fetches `image_url` server-side, so the poster uploads each photo to uguu / litterbox /
+catbox / 0x0 and hands Meg the URL. Only those hosts are allow-listed, redirects are refused,
+and the child environment is scrubbed of credentials — but the media itself is public.
+
+**If you see this:** `Uploading … to a public host` in the log. That is by design; if it is
+unacceptable, run your own image host and pass `--image-url`.
+
+## 16. Handler-level regressions are invisible without integration tests
 
 A refactor once nested the whole processing block inside an unrelated `if`, so every real
 event returned `200 {"processed": []}` and matched nothing — accepted, dropped, logged

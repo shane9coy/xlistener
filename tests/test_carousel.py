@@ -9,12 +9,17 @@ import os
 import sys
 from pathlib import Path
 
-# Fake creds BEFORE importing the script (its .env loader uses setdefault).
-os.environ["THREADS_ACCESS_TOKEN"] = "test-token"
-os.environ["THREADS_USER_ID"] = "22222222222222222"
+import tempfile
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+
+# The poster loads .env lazily into a private dict (never os.environ). Point it at a
+# throwaway .env so a real credential file is never read during tests.
+_ENVDIR = Path(tempfile.mkdtemp(prefix="xlistener-env-"))
+(_ENVDIR / ".env").write_text(
+    "THREADS_ACCESS_TOKEN=test-token\nTHREADS_USER_ID=22222222222222222\n")
+os.environ["THREADS_POST_ENV"] = str(_ENVDIR / ".env")
 
 import mirror as m  # noqa: E402
 
@@ -46,6 +51,12 @@ def expect_exit(name, fn):
 
 # ---------------- parent container payload ----------------
 captured = []
+uploads: list[str] = []
+
+
+def counting_upload(path):
+    uploads.append(str(path))
+    return "https://cdn.example/" + Path(path).name
 
 
 def fake_form_post(url, data, timeout=30.0):
@@ -90,7 +101,7 @@ p2t._form_post = lambda url, data, timeout=30.0: (
     {"id": ("parent9" if data.get("media_type") == "CAROUSEL" else f"child{len(captured)}")},
 )[2]
 p2t._wait_for_image_ready = lambda *a, **k: None
-p2t.upload_to_public_host = lambda p: "https://cdn.example/" + Path(p).name
+p2t.upload_to_public_host = counting_upload
 p2t._publish_with_verify = lambda token, uid, cid, recreate_fn=None, max_retries=2: {
     "id": "post123", "permalink": "https://www.threads.net/@example_threads_user/post/ABC"}
 
@@ -124,12 +135,22 @@ expect_exit("post_carousel rejects 21 images",
 expect_exit("post_carousel rejects mixing paths and urls",
             lambda: p2t.post_carousel("x", image_paths=["/tmp/a.jpg"], image_urls=["https://a/b.jpg"]))
 
-# ---------------- dry run builds a plan and posts nothing ----------------
+# ---------------- dry run: plan only, no posts, no uploads ----------------
 captured.clear()
+uploads.clear()
 dry = p2t.post_carousel("caption", image_urls=["https://a/1.jpg", "https://a/2.jpg"], dry_run=True)
 check("dry run returns a plan", dry.get("dry_run") is True and len(dry.get("steps", [])) == 3, dry)
 check("dry run posts nothing", captured == [], captured)
 check("dry run reports item count", dry.get("carousel_items") == 2)
+
+# single-image dry run must not upload either (this was the observe-mode media leak)
+_img = _tmp / "single.jpg"
+_img.write_bytes(b"\xff\xd8\xff\xe0fake")
+uploads.clear()
+plan = p2t.post_image("caption", image_path=str(_img), image_url=None, dry_run=True)
+check("single-image dry run performs no upload", uploads == [], uploads)
+check("single-image dry run does not print the real token",
+      plan["step1_payload"]["access_token"] == "<token>", plan["step1_payload"].get("access_token"))
 
 # ---------------- mirror.run_threads_post picks the right CLI flag ----------------
 captured_cmd = {}

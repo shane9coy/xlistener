@@ -27,8 +27,10 @@ it appears on Threads within seconds.
 5. **X bills per POST RETURNED, not per API call.** The only free X calls are
    management endpoints (`/2/webhooks`, `/2/activity/subscriptions`). Never read a
    timeline without explicit user approval, and never run a pagination loop.
-6. **Do not write test rows into `state.db`.** The dedupe table's `MAX(tweet_id)`
-   is the bookmark; a synthetic oversized id can wedge future mirroring.
+6. **Do not write rows into `state.db` by hand.** It is the claim ledger: a fake
+   `ok` row permanently suppresses the real post that has that id, and a fake
+   `pending` row blocks it for 15 minutes. Use `tools/replay_backlog.py --reset-errors`
+   to clear genuine failures instead.
 
 ## Phase 0 — collect inputs (ask, don't guess)
 
@@ -66,15 +68,18 @@ comments). Fill `config.json`:
 
 - `x_user_handle` — without `@`
 - `threads_handle` — without `@`
-- `x_user_id` — leave `""` if unknown; the listener resolves it on first start
-  (one billed read) and writes it back into `config.json`
+- `x_user_id` — **required** numeric id of the account to mirror. The listener does
+  not auto-resolve it (that costs a billed call on every boot and an empty value
+  makes every delivery fail the author check). If you do not know it:
+  `./venv/bin/python tools/resolve_user_id.py --handle <handle>` — one *user* lookup,
+  not a post read — then paste the id into `config.json`
 - everything else can stay at its default
 
 **Gate 1:** `./venv/bin/python tools/doctor.py --offline` runs and shows the runtime
-and file checks passing. Expect exactly **one** FAIL at this point — `.env required
-keys` (the Threads values arrive in Phase 2). Everything else that runs offline
-should PASS; `state.db missing` and the listener/Threads/CRC checks will be WARN or
-SKIP until later phases. If `.env exists`, `config.json parses`,
+and file checks passing. Expect exactly **two** FAILs at this point — `.env required
+keys` (the Threads values arrive in Phase 2) and `config.x_user_id` (Phase 1 supplies
+it). Everything else that runs offline should PASS; `state.db missing` and the
+listener/Threads/CRC checks will be WARN or SKIP until later phases. If `.env exists`, `config.json parses`,
 `.gitignore covers secrets` or `python dependencies` fail, fix those first.
 
 ## Phase 2 — Threads credentials
@@ -191,8 +196,8 @@ Verification, cheapest first:
 
 0. **Observe mode first.** Set `"observe_only": true` under `webhook` in
    `config.json`, restart, and let it see a post or two. It logs
-   `[OBSERVE] would post tweet …` and publishes nothing (no Threads posts, no
-   `state.db` rows). This proves delivery, signature verification, author filtering
+   `[OBSERVE] would post tweet …` and publishes nothing, uploads no media to any
+   image host, and writes no `state.db` rows. This proves delivery, signature verification, author filtering
    and media download before anything reaches the user's account. Then set it back
    to `false` and restart.
 1. **Auth path, no side effects** — sign an empty payload with the consumer secret
@@ -220,7 +225,8 @@ tail -f mirror.log
 Tell the user: which handles are linked, that X charges $0.005 per delivered
 `post.create` event and per post read by any tool, what the budget caps are
 (`python x_budget.py` shows today's spend), how to watch logs (`tail -f mirror.log`),
-and that the Threads token needs refreshing before day 60.
+that a `200` from the webhook means queued (not published — wait for `[OK]`), and that
+the Threads token needs refreshing before day 60.
 
 ## Failure table
 
@@ -232,7 +238,10 @@ Match the log line or API error, apply the action, do not guess.
 | `POST rejected … signature headers present=none` | Not from X (or a proxy is stripping headers) | Ensure the proxy forwards headers untouched |
 | `event types=['data']` but then `ignoring XAA event_type=…` | Subscription is for another event type | Only `post.create` is mirrored; check the subscription |
 | `event counts: {'tweet_create_events': 0}` | X delivered an **empty** event array (seen in the wild) | Nothing to mirror; if persistent, this is an X-side fault |
-| `[SKIP not-author] tweet … author=…` | `x_user_id` in `config.json` is wrong | Fix to the account's numeric id |
+| `[SKIP not-author] tweet … author=…` | `x_user_id` in `config.json` is wrong | Fix to the account's numeric id (`tools/resolve_user_id.py`) |
+| `413 payload too large` in the access log | Body exceeded the 1 MiB cap | X payloads are far smaller; check for a proxy/scanning layer sending junk |
+| Listener exits with code 2 and "missing a numeric x_user_id" | `config.json` has no `x_user_id` | Run `tools/resolve_user_id.py`, then restart |
+| `200 {"queued": true}` but no `[OK]` line | Publishing is asynchronous; the background task failed and recorded an `error` row | Read the `[ERR …]` line above it; the next delivery retries automatically |
 | `[SKIP reply]` / `[SKIP retweet]` / `[SKIP quote]` | Working as designed | Quotes: set `webhook.mirror_quote_posts` |
 | `[SKIP video-only]` | Video is not mirrored | Out of scope |
 | `[ERR post] tweet …: threads-post failed` | Threads publish failed | Read the stderr in the log; check token (Phase 2) |
@@ -246,8 +255,9 @@ Match the log line or API error, apply the action, do not guess.
 
 - Do not run `tools/replay_backlog.py` without a user-approved `--since`: it reads
   the X timeline and is billed per post returned.
-- Do not delete `state.db` to "fix" anything — it is the dedupe ledger; deleting it
-  re-mirrors history.
+- Do not delete `state.db` to "fix" anything — it is the claim ledger; deleting it
+  re-mirrors history. Failed rows are retryable automatically; clear them with
+  `tools/replay_backlog.py --reset-errors` if you need a manual reset.
 - Do not raise the `x_budget` caps to get past a failure. A spend cap firing means
   something is looping; find the loop.
 - Do not POST samples with real tweet ids into `state.db`.

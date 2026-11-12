@@ -6,12 +6,16 @@ therefore drain a credit balance: a loop of 10 pages x 100 posts = 1000 posts
 = $5.00 at the documented $0.005/post rate. This module is the guard that every
 X-reading path must charge against before it spends anything.
 
-Default limits (env-overridable, but hard-clamped to a ceiling so nothing can be
-raised past it by a stray .env edit):
+Limits resolve in this order, then are clamped to a hard ceiling so nothing can
+raise a cap past it:
 
-    X_MAX_POSTS_PER_CALL = 10     max_results ceiling for one call
-    X_MAX_CALLS_PER_DAY  = 10     X read calls per UTC day
-    X_MAX_POSTS_PER_DAY  = 10     posts returned per UTC day
+    1. env override:  X_MAX_POSTS_PER_CALL / X_MAX_CALLS_PER_DAY / X_MAX_POSTS_PER_DAY
+    2. config block:  cfg["x_budget"]["max_posts_per_call" / "max_calls_per_day" /
+                      "max_posts_per_day"] (passed to get_budget(limits=...))
+    3. built-in default: 10 / 10 / 10
+
+A missing or unparsable value falls through to the next source; a negative value
+is ignored. `_note`-style keys in the config block are ignored.
 
 Worst case at default limits: 10 posts x $0.005 = $0.05 per day.
 
@@ -20,7 +24,7 @@ UTC date change. Everything else is in-process.
 
 Usage:
     import x_budget
-    budget = x_budget.get_budget(HERE)
+    budget = x_budget.get_budget(HERE, logger=logger, limits=cfg.get("x_budget"))
     max_results = budget.cap_post_count(50)   # -> 10
     budget.note_call()                        # raises XBudgetExceeded if spent out
     resp = client.get_users_tweets(max_results=max_results, ...)
@@ -50,25 +54,55 @@ class XBudgetExceeded(RuntimeError):
     """Raised instead of making an X read that would exceed the configured cap."""
 
 
-def _env_int(name: str, default: int, ceiling: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    if value < 0:
-        return default
-    return min(value, ceiling)
+def _parse_int(raw: Any) -> int | None:
+    """Parse a non-negative int. None when unset, blank, boolean, or unparsable."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            value = int(raw)
+        except (OverflowError, ValueError):
+            return None
+    else:
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            value = int(text)
+        except (TypeError, ValueError):
+            return None
+    return value if value >= 0 else None
 
 
-def configured_limits() -> dict[str, int]:
-    return {
-        "posts_per_call": _env_int("X_MAX_POSTS_PER_CALL", DEFAULT_POSTS_PER_CALL, CEILING_POSTS_PER_CALL),
-        "calls_per_day": _env_int("X_MAX_CALLS_PER_DAY", DEFAULT_CALLS_PER_DAY, CEILING_CALLS_PER_DAY),
-        "posts_per_day": _env_int("X_MAX_POSTS_PER_DAY", DEFAULT_POSTS_PER_DAY, CEILING_POSTS_PER_DAY),
-    }
+# (public limit name, config key in cfg["x_budget"], env var, default, ceiling)
+_LIMIT_SPECS = (
+    ("posts_per_call", "max_posts_per_call", "X_MAX_POSTS_PER_CALL",
+     DEFAULT_POSTS_PER_CALL, CEILING_POSTS_PER_CALL),
+    ("calls_per_day", "max_calls_per_day", "X_MAX_CALLS_PER_DAY",
+     DEFAULT_CALLS_PER_DAY, CEILING_CALLS_PER_DAY),
+    ("posts_per_day", "max_posts_per_day", "X_MAX_POSTS_PER_DAY",
+     DEFAULT_POSTS_PER_DAY, CEILING_POSTS_PER_DAY),
+)
+
+
+def configured_limits(limits: dict | None = None) -> dict[str, int]:
+    """Effective caps: config block, then an env override, then a hard ceiling.
+
+    `limits` is the parsed `cfg["x_budget"]` block (or None). Only the three known
+    keys are read, so `_note`-style documentation keys are ignored. An env var set
+    to a valid non-negative integer overrides the matching config value. Both are
+    clamped to the ceiling, so neither source can raise a cap past it.
+    """
+    block = limits if isinstance(limits, dict) else {}
+    effective: dict[str, int] = {}
+    for name, config_key, env_name, default, ceiling in _LIMIT_SPECS:
+        env_value = _parse_int(os.environ.get(env_name))
+        config_value = _parse_int(block.get(config_key))
+        value = env_value if env_value is not None else config_value
+        if value is None:
+            value = default
+        effective[name] = min(value, ceiling)
+    return effective
 
 
 def _utc_today() -> str:
@@ -199,11 +233,23 @@ class XBudget:
 _instances: dict[str, XBudget] = {}
 
 
-def get_budget(state_dir: Path, logger: Any = None) -> XBudget:
-    """Return the process-wide budget for a state directory."""
+def get_budget(state_dir: Path, logger: Any = None, limits: dict | None = None) -> XBudget:
+    """Return the process-wide budget for a state directory.
+
+    `limits` is the parsed `cfg.get("x_budget")` block. The first call for a
+    directory creates the instance and fixes its caps; later calls only attach a
+    logger (the caps cannot be changed mid-process).
+    """
     key = str(Path(state_dir).resolve())
     if key not in _instances:
-        _instances[key] = XBudget(state_path=Path(state_dir) / STATE_FILENAME, logger=logger)
+        resolved = configured_limits(limits)
+        _instances[key] = XBudget(
+            state_path=Path(state_dir) / STATE_FILENAME,
+            posts_per_call=resolved["posts_per_call"],
+            calls_per_day=resolved["calls_per_day"],
+            posts_per_day=resolved["posts_per_day"],
+            logger=logger,
+        )
     elif logger is not None and _instances[key].logger is None:
         _instances[key].logger = logger
     return _instances[key]

@@ -18,6 +18,12 @@ for f in tests/*.py; do
   "$PY" "$f" || status=1
 done
 
+# Same gate as CI: every tool must at least import and answer --help.
+for t in tools/doctor.py tools/resolve_user_id.py tools/setup_xaa.py tools/threads_oauth.py tools/refresh_threads_token.py tools/replay_backlog.py; do
+  printf '\n== %s --help\n' "$t"
+  "$PY" "$t" --help > /dev/null || { echo "FAILED: $t --help"; status=1; }
+done
+
 if [ "$status" -eq 0 ]; then
   echo
   echo "ALL SUITES PASSED"

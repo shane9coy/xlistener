@@ -8,6 +8,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/xlistener
 ExecStart=%h/xlistener/venv/bin/python %h/xlistener/webhook_listener.py --host 127.0.0.1 --port 8644
+# Startup must not hang on a network call; fail fast and let Restart retry.
+TimeoutStartSec=60
 Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

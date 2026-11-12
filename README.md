@@ -14,9 +14,10 @@ X is replacing the Account Activity API with the X Activity API (AAA EOL 2027-01
 - **Dual signature headers** — `X-Twitter-Webhooks-Signature-OAuth2` (preferred, OAuth 2.0 client secret) with the legacy `X-Twitter-Webhooks-Signature` as fallback.
 - **CRC endpoint with a signing-oracle guard** — only opaque tokens are signed, so it cannot forge an event.
 - **Carousel publishing** — children → parent → publish, the only order Threads accepts.
-- **Idempotent dedupe** — SQLite `state.db` stops a retried or duplicated delivery from double-posting.
+- **Idempotent claim ledger** — SQLite `state.db` claims a post *before* publishing, so a duplicate delivery or an X retry cannot double-post; failed attempts stay retryable.
+- **Fast acknowledgement** — the listener answers X immediately and publishes on a background task, so X's 10-second webhook timeout is never on the publishing path. A `200` means *queued*, not published; watch the log for `[OK]`.
 - **Hard spend caps** — per-call and per-day caps enforced before any X timeline read, persisted in `.x-budget.json`.
-- **Webhook-only live path** — no polling loop; `mirror.py` is kept for manual backfills only.
+- **Webhook-only live path** — no polling loop. `mirror.py` is shared plumbing; missed posts are backfilled deliberately with `tools/replay_backlog.py`.
 
 ## Quick start
 
@@ -44,7 +45,7 @@ Set `"observe_only": true` under `webhook` in `config.json` for the first day. T
 [OBSERVE] would post tweet 1234567890123456789: text='gm' image=yes
 ```
 
-Watch `mirror.log`, confirm the posts it *would* mirror are the ones you expect, then set it back to `false` and restart. That catches a wrong `x_user_id` or an unexpected filter decision before anything reaches your account.
+Observe mode publishes nothing, uploads nothing to any image host, and writes no `state.db` rows. Watch `mirror.log`, confirm the posts it *would* mirror are the ones you expect, then set it back to `false` and restart. That catches a wrong `x_user_id` or an unexpected filter decision before anything reaches your account.
 
 ## Architecture
 
@@ -94,7 +95,9 @@ X bills per post, not per call. Management endpoints (`GET /2/webhooks`, `GET /2
 | Timeline read | $0.005 per post returned | 10 posts/call, 10 calls/day, 10 posts/day |
 | Worst case at default caps | — | $0.05/day |
 
-`python x_budget.py` prints today's spend. `X_MAX_*` can lower the caps only.
+`python x_budget.py` prints today's spend. Caps come from the `x_budget` block in `config.json`; `X_MAX_*` environment variables override them. Both are clamped to a hard ceiling, so neither source can raise a cap past it.
+
+Webhook bodies are capped at 1 MiB (413 beyond that). Images are uploaded to an allow-listed anonymous host (uguu / litterbox / catbox / 0x0) so Meta can fetch them — see [SECURITY.md](SECURITY.md).
 
 ## Requirements
 

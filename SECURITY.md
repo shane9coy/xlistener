@@ -19,6 +19,14 @@ Useful pre-push check:
 docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest detect -s /repo -v
 ```
 
+## Request size
+
+The webhook endpoint refuses bodies over **1 MiB**: a declared `Content-Length` over the cap
+is rejected with `413` before authentication, and a chunked body is cut off mid-stream so an
+unauthenticated caller cannot make the process allocate unbounded memory. Put a request-size
+limit at the edge too (Cloudflare's own limit is the outer bound) and consider `MemoryMax=` on
+the systemd unit.
+
 ## Webhook verification
 
 The listener refuses any POST that does not carry a valid HMAC signature over the
@@ -40,8 +48,24 @@ opaque-token pattern, which no JSON object can satisfy.
 
 ## Media allow-list
 
-Photos are only downloaded from X's own image CDN (hosts ending `.twimg.com`, https
-only). A payload cannot make the listener fetch an arbitrary URL.
+Photos are only downloaded from X's own image CDN: https only, host suffix `.twimg.com`,
+no userinfo, no backslashes or `%5c`, and redirects are not followed. A payload cannot make
+the listener fetch an arbitrary URL, and a parser-differential URL cannot redirect the fetch.
+
+## Media egress (disclosure)
+
+Publishing requires Meta to fetch each image over HTTPS. The poster uploads mirrored images to
+one of four anonymous public hosts — `uguu.se` (temporary), `litterbox.catbox.moe` (24h),
+`catbox.moe` (permanent), `0x0.st` (24h) — and only URLs on an allow-list are handed to Meta.
+Treat every mirrored image as public content. If that is unacceptable, self-host and pass an
+`image_url` you control.
+
+## Child processes
+
+The Threads poster runs as a subprocess with a minimal environment (`PATH`, `HOME`, locale,
+TLS settings) rather than the parent's, so credentials exported into the listener's shell are
+not inherited by it or by its `curl` uploads. The poster loads its own `.env` into a private
+dict and dry runs print `"<token>"` instead of the real credential.
 
 ## Reporting
 

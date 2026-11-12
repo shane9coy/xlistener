@@ -9,6 +9,7 @@
 #   sudo systemctl enable --now cloudflared
 #
 # X's webhook requirement: https, publicly reachable, no port, answers the CRC GET.
+# Cloudflare's request-size limit is the outer bound for webhook bodies (defense in depth alongside the app's 1 MiB cap).
 
 tunnel: <TUNNEL_ID>
 credentials-file: /home/<you>/.cloudflared/<TUNNEL_ID>.json

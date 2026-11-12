@@ -40,6 +40,6 @@ jobs:
       - name: Tools respond to --help
         run: |
           set -e
-          for t in tools/doctor.py tools/setup_xaa.py tools/threads_oauth.py tools/refresh_threads_token.py tools/replay_backlog.py; do
+          for t in tools/doctor.py tools/resolve_user_id.py tools/setup_xaa.py tools/threads_oauth.py tools/refresh_threads_token.py tools/replay_backlog.py; do
             python "$t" --help > /dev/null
           done

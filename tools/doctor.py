@@ -69,8 +69,10 @@ def skip(name, detail=""):
     record("SKIP", name, detail)
 
 
-def load_env() -> dict:
-    p = REPO / ".env"
+def load_env(cfg: dict | None = None) -> dict:
+    """Read <env_dir>/.env, where env_dir is the configured (repo-relative) path."""
+    env_dir = m.resolve_dir((cfg or {}).get("env_dir"), REPO)
+    p = env_dir / ".env"
     if not p.exists():
         return {}
     return m.load_env_file(p)
@@ -79,12 +81,12 @@ def load_env() -> dict:
 def main() -> int:
     global QUIET
     ap = argparse.ArgumentParser(description="Check XListener configuration and health.")
-    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--json", action="store_true", help="machine-readable output (implies quiet)")
     ap.add_argument("--offline", action="store_true", help="skip network checks")
     ap.add_argument("--config", default=str(REPO / "config.json"))
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
-    QUIET = args.quiet
+    QUIET = args.quiet or args.json
 
     # ---------- 1. runtime ----------
     if sys.version_info >= (3, 10):
@@ -115,12 +117,14 @@ def main() -> int:
         if cfg.get("x_user_id"):
             ok("config.x_user_id", str(cfg["x_user_id"]))
         else:
-            warn("config.x_user_id empty", "will be resolved on first start (one API call)",
-                 "set x_user_id in config.json to avoid the call")
+            fail("config.x_user_id", "missing — required, no auto-resolve",
+                 "set x_user_id in config.json (get it: ./venv/bin/python tools/resolve_user_id.py)")
 
-    env = load_env()
+    env = load_env(cfg)
     if not env:
-        fail(".env exists", "not found", "cp .env.example .env and fill in the credentials")
+        env_path = m.resolve_dir(cfg.get("env_dir"), REPO) / ".env"
+        fail(".env exists", f"not found at {env_path}",
+             "cp .env.example .env and fill in the credentials")
     else:
         ok(".env exists", f"{len(env)} keys")
         required = ["X_CONSUMER_KEY", "X_CONSUMER_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET",
@@ -183,7 +187,7 @@ def main() -> int:
     # ---------- 4. budget ----------
     try:
         import x_budget
-        b = x_budget.get_budget(REPO)
+        b = x_budget.get_budget(REPO, limits=cfg.get("x_budget"))
         ok("X spend budget", b.summary())
     except Exception as e:  # noqa: BLE001
         warn("X spend budget", str(e))

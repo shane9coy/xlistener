@@ -2,7 +2,7 @@
   "_comment": "XListener configuration. Copy to config.json and fill in. Keys prefixed with _ are notes.",
   "x_user_handle": "your_x_handle",
   "x_user_id": "1111111111111111111",
-  "_x_user_id_note": "Numeric id of the X account to mirror. Leave empty to auto-resolve from x_user_handle on first run (costs one API call).",
+  "_x_user_id_note": "REQUIRED. Numeric id of the X account to mirror. The listener does not auto-resolve it from x_user_handle; an empty value fails startup and tools/doctor.py.",
   "threads_handle": "your_threads_handle",
   "_threads_handle_note": "Numeric Threads account id goes in .env as THREADS_USER_ID. This is the @handle used only for source URLs and logs.",
 
@@ -13,6 +13,8 @@
   "_state_db_note": "SQLite dedupe + audit table. Never commit it. One row per mirrored post.",
   "media_cache_dir": "media_cache",
   "_media_cache_note": "Downloaded X images live here before upload. Never commit it; it is X content.",
+  "media_cache_max_age_hours": 48,
+  "_media_cache_max_age_note": "Cached X images older than this are pruned after each successful mirror. 0 disables pruning.",
   "log_file": "mirror.log",
   "log_max_bytes": 5242880,
   "log_backup_count": 3,
@@ -20,12 +22,11 @@
   "threads_poster_script": "threads_poster.py",
   "python_bin": "",
   "_python_bin_note": "Interpreter used to run threads_poster.py. Empty = the interpreter running the listener.",
-
-  "max_tweets_per_tick": 10,
-  "_max_note": "Legacy polling cap; also the per-call X read cap enforced by x_budget.py.",
+  "publish_timeout_seconds": 150,
+  "_publish_timeout_note": "Subprocess budget (seconds) for one Threads poster run, including image uploads. A run that exceeds it fails instead of hanging the delivery.",
 
   "x_budget": {
-    "_note": "Hard spend caps for anything that READS X posts. X bills per post RETURNED, not per call, so one paginated loop can drain a balance. Env overrides X_MAX_POSTS_PER_CALL / X_MAX_CALLS_PER_DAY / X_MAX_POSTS_PER_DAY can lower these but never raise them past the ceiling.",
+    "_note": "Hard spend caps for anything that READS X posts, honored by x_budget.get_budget(). X bills per post RETURNED, not per call, so one paginated loop can drain a balance. An env override (X_MAX_POSTS_PER_CALL / X_MAX_CALLS_PER_DAY / X_MAX_POSTS_PER_DAY) wins when set, and every value is clamped to a hard ceiling so nothing can raise a cap past it.",
     "max_posts_per_call": 10,
     "max_calls_per_day": 10,
     "max_posts_per_day": 10
