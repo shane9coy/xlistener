@@ -8,6 +8,7 @@ from pathlib import Path
 
 # Tests live in tests/ in the repo but at the service root on a deployed install.
 _HERE = Path(__file__).resolve().parent
+REPO = _HERE if (_HERE / "mirror.py").exists() else _HERE.parent
 sys.path.insert(0, str(REPO))
 import x_budget as xb
 

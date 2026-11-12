@@ -25,7 +25,10 @@ os.environ["THREADS_POST_ENV"] = str(_ENVDIR / ".env")
 
 import mirror as m  # noqa: E402
 
-cfg = m.load_config(REPO / "config.example.json")
+_cfg_path = REPO / "config.example.json"
+if not _cfg_path.exists():
+    _cfg_path = REPO / "config.json"
+cfg = m.load_config(_cfg_path)
 script_path = REPO / cfg["threads_poster_script"]
 spec = importlib.util.spec_from_file_location("p2t", script_path)
 p2t = importlib.util.module_from_spec(spec)
