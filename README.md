@@ -1,4 +1,4 @@
-![tests](https://github.com/<owner>/xlistener/actions/workflows/tests.yml/badge.svg)
+<img src="docs/images/xlistener-banner-dark.jpg" alt="XListener: a figure stands in a dark cave where post-shaped shadows flicker on the wall, and steps through a cracked barrier into a bright open world" width="100%">
 
 # XListener
 
